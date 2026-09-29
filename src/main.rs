@@ -1,9 +1,6 @@
-//! Gum CLI - Command-line interface for the Gum markup language
-//!
-//! Provides validation, formatting, and conversion tools for Gum documents.
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,7 +33,7 @@ enum Commands {
     Convert {
         /// Path to the Gum file to convert
         file: PathBuf,
-        /// Target format (json, html, toml)
+        /// Target format (json, toml, yaml)
         #[arg(short, long)]
         to: String,
         /// Output file (default: stdout)
@@ -55,7 +52,6 @@ fn main() -> Result<ExitCode> {
     }
 }
 
-/// Validate a Gum document
 fn cmd_validate(file: &PathBuf) -> Result<ExitCode> {
     let content = fs::read_to_string(file)
         .with_context(|| format!("Failed to read file: {}", file.display()))?;
@@ -81,7 +77,6 @@ fn cmd_validate(file: &PathBuf) -> Result<ExitCode> {
     }
 }
 
-/// Format a Gum document
 fn cmd_format(file: &PathBuf, write: bool) -> Result<ExitCode> {
     let content = fs::read_to_string(file)
         .with_context(|| format!("Failed to read file: {}", file.display()))?;
@@ -102,7 +97,6 @@ fn cmd_format(file: &PathBuf, write: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Convert a Gum document to another format
 fn cmd_convert(file: &PathBuf, to: &str, output: Option<&std::path::Path>) -> Result<ExitCode> {
     let content = fs::read_to_string(file)
         .with_context(|| format!("Failed to read file: {}", file.display()))?;
@@ -112,11 +106,11 @@ fn cmd_convert(file: &PathBuf, to: &str, output: Option<&std::path::Path>) -> Re
 
     let converted = match to.to_lowercase().as_str() {
         "json" => convert_to_json(&doc)?,
-        "html" => convert_to_html(&doc)?,
         "toml" => convert_to_toml(&doc)?,
+        "yaml" => convert_to_yaml(&doc)?,
         _ => {
             eprintln!("✗ Unsupported format: {}", to);
-            eprintln!("  Supported formats: json, html, toml");
+            eprintln!("  Supported formats: json, toml, yaml");
             return Ok(ExitCode::FAILURE);
         }
     };
@@ -132,44 +126,75 @@ fn cmd_convert(file: &PathBuf, to: &str, output: Option<&std::path::Path>) -> Re
     Ok(ExitCode::SUCCESS)
 }
 
-/// Convert Gum AST to JSON
 fn convert_to_json(doc: &gum_core::Document) -> Result<String> {
-    serde_json::to_string_pretty(doc).with_context(|| "Failed to serialize to JSON")
-}
-
-/// Convert Gum AST to HTML
-fn convert_to_html(doc: &gum_core::Document) -> Result<String> {
-    let mut html = String::new();
-    html.push_str("<!DOCTYPE html>\n<html>\n<head>\n  <meta charset=\"UTF-8\">\n  <title>Gum Document</title>\n</head>\n<body>\n");
+    let mut map = serde_json::Map::new();
 
     for element in &doc.elements {
-        match element {
-            gum_core::DocumentElement::Assignment(assignment) => {
-                html.push_str("  <div class=\"assignment\">\n");
-                html.push_str(&format!(
-                    "    <span class=\"key\">{}</span>",
-                    escape_html(&assignment.key.as_str())
-                ));
-                html.push_str(&format!(
-                    " = <span class=\"value\">{}</span>\n",
-                    escape_html(&format_value(&assignment.value))
-                ));
-                html.push_str("  </div>\n");
-            }
-            gum_core::DocumentElement::NonAssignment(na) => {
-                // Skip whitespace-only content
-                if !na.content.trim().is_empty() {
-                    html.push_str(&format!("  <!-- {} -->\n", escape_html(&na.content)));
-                }
-            }
+        if let gum_core::DocumentElement::Assignment(assignment) = element {
+            let key = assignment.key.as_str();
+            let value = gum_value_to_json(&assignment.value);
+            map.insert(key, value);
         }
     }
 
-    html.push_str("</body>\n</html>\n");
-    Ok(html)
+    serde_json::to_string_pretty(&JsonValue::Object(map))
+        .with_context(|| "Failed to serialize to JSON")
 }
 
-/// Convert Gum AST to TOML
+fn convert_to_yaml(doc: &gum_core::Document) -> Result<String> {
+    let mut map = serde_json::Map::new();
+
+    for element in &doc.elements {
+        if let gum_core::DocumentElement::Assignment(assignment) = element {
+            let key = assignment.key.as_str();
+            let value = gum_value_to_json(&assignment.value);
+            map.insert(key, value);
+        }
+    }
+
+    serde_yaml::to_string(&JsonValue::Object(map))
+        .with_context(|| "Failed to serialize to YAML")
+}
+
+fn gum_value_to_json(value: &gum_core::Value) -> JsonValue {
+    match value {
+        gum_core::Value::String(s) => {
+            let content = match s {
+                gum_core::StringValue::Basic(c) => c,
+                gum_core::StringValue::MultilineBasic(c) => c,
+                gum_core::StringValue::Literal(c) => c,
+                gum_core::StringValue::MultilineLiteral(c) => c,
+            };
+            JsonValue::String(content.clone())
+        }
+        gum_core::Value::Number(n) => match n {
+            gum_core::NumberValue::Integer(i) => {
+                serde_json::Number::from(*i).into()
+            }
+            gum_core::NumberValue::Float(f) => {
+                serde_json::Number::from_f64(*f)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null)
+            }
+        },
+        gum_core::Value::Boolean(b) => JsonValue::Bool(*b),
+        gum_core::Value::Null => JsonValue::Null,
+        gum_core::Value::Table(table) => {
+            let mut map = serde_json::Map::new();
+            for entry in &table.entries {
+                let key = entry.key.as_str();
+                let val = gum_value_to_json(&entry.value);
+                map.insert(key, val);
+            }
+            JsonValue::Object(map)
+        }
+        gum_core::Value::List(list) => {
+            let elements: Vec<JsonValue> = list.elements.iter().map(gum_value_to_json).collect();
+            JsonValue::Array(elements)
+        }
+    }
+}
+
 fn convert_to_toml(doc: &gum_core::Document) -> Result<String> {
     let mut toml = String::new();
 
@@ -186,30 +211,6 @@ fn convert_to_toml(doc: &gum_core::Document) -> Result<String> {
     Ok(toml)
 }
 
-/// Format a value for display
-fn format_value(value: &gum_core::Value) -> String {
-    match value {
-        gum_core::Value::String(s) => {
-            let content = match s {
-                gum_core::StringValue::Basic(c) => c,
-                gum_core::StringValue::MultilineBasic(c) => c,
-                gum_core::StringValue::Literal(c) => c,
-                gum_core::StringValue::MultilineLiteral(c) => c,
-            };
-            format!("\"{}\"", content)
-        }
-        gum_core::Value::Number(n) => match n {
-            gum_core::NumberValue::Integer(i) => format!("{}", i),
-            gum_core::NumberValue::Float(f) => format!("{}", f),
-        },
-        gum_core::Value::Boolean(b) => format!("{}", b),
-        gum_core::Value::Null => "null".to_string(),
-        gum_core::Value::Table(_) => "{...}".to_string(),
-        gum_core::Value::List(_) => "[...]".to_string(),
-    }
-}
-
-/// Format a value for TOML output
 fn format_value_toml(value: &gum_core::Value) -> String {
     match value {
         gum_core::Value::String(s) => {
@@ -226,7 +227,7 @@ fn format_value_toml(value: &gum_core::Value) -> String {
             gum_core::NumberValue::Float(f) => format!("{}", f),
         },
         gum_core::Value::Boolean(b) => format!("{}", b),
-        gum_core::Value::Null => "\"\"".to_string(), // TOML doesn't have null, use empty string
+        gum_core::Value::Null => "\"\"".to_string(),
         gum_core::Value::Table(table) => {
             let mut parts = Vec::new();
             for entry in &table.entries {
@@ -245,11 +246,89 @@ fn format_value_toml(value: &gum_core::Value) -> String {
     }
 }
 
-/// Escape HTML special characters
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_gum(input: &str) -> gum_core::Document {
+        gum_core::parse(input).expect("Failed to parse test input")
+    }
+
+    #[test]
+    fn test_json_basic_assignments() {
+        let doc = parse_gum(r#"name = "Gum""#);
+        let json = convert_to_json(&doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["name"], "Gum");
+    }
+
+    #[test]
+    fn test_json_number_types() {
+        let doc = parse_gum("int_val = 42\nfloat_val = 2.71");
+        let json = convert_to_json(&doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["int_val"], 42);
+        assert_eq!(parsed["float_val"], 2.71);
+    }
+
+    #[test]
+    fn test_json_boolean_and_null() {
+        let doc = parse_gum("enabled = true\ndisabled = false\nnothing = null");
+        let json = convert_to_json(&doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["enabled"], true);
+        assert_eq!(parsed["disabled"], false);
+        assert_eq!(parsed["nothing"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_json_nested_table() {
+        let doc = parse_gum(r#"server = { host = "localhost", port = 8080 }"#);
+        let json = convert_to_json(&doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["server"]["host"], "localhost");
+        assert_eq!(parsed["server"]["port"], 8080);
+    }
+
+    #[test]
+    fn test_json_list() {
+        let doc = parse_gum(r#"items = [1, "two", true]"#);
+        let json = convert_to_json(&doc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["items"][0], 1);
+        assert_eq!(parsed["items"][1], "two");
+        assert_eq!(parsed["items"][2], true);
+    }
+
+    #[test]
+    fn test_yaml_basic() {
+        let doc = parse_gum(r#"name = "Gum""#);
+        let yaml = convert_to_yaml(&doc).unwrap();
+        assert!(yaml.contains("name:"));
+        assert!(yaml.contains("Gum"));
+    }
+
+    #[test]
+    fn test_yaml_nested() {
+        let doc = parse_gum(r#"server = { host = "localhost" }"#);
+        let yaml = convert_to_yaml(&doc).unwrap();
+        assert!(yaml.contains("server:"));
+        assert!(yaml.contains("host:"));
+    }
+
+    #[test]
+    fn test_toml_basic() {
+        let doc = parse_gum(r#"name = "Gum""#);
+        let toml = convert_to_toml(&doc).unwrap();
+        assert_eq!(toml.trim(), r#"name = "Gum""#);
+    }
+
+    #[test]
+    fn test_toml_table() {
+        let doc = parse_gum(r#"server = { host = "localhost", port = 8080 }"#);
+        let toml = convert_to_toml(&doc).unwrap();
+        assert!(toml.contains("server ="));
+        assert!(toml.contains(r#"host = "localhost""#));
+        assert!(toml.contains("port = 8080"));
+    }
 }
